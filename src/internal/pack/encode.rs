@@ -1,6 +1,8 @@
 //! Pack encoder capable of building streamed `.pack`/`.idx` pairs with optional delta compression,
 //! windowing, and asynchronous writers.
-
+const MIN_PROCESS_NUMBER: usize=1000;
+const CHANNEL_CONTENT:usize=10;
+const MIN_SIMILARITY:f64=0.5;
 use std::{
     cmp::Ordering,
     collections::VecDeque,
@@ -510,7 +512,7 @@ impl PackEncoder {
 
                     let sym_ratio = (try_base.0.data.len().min(entry.data.len()) as f64)
                         / (try_base.0.data.len().max(entry.data.len()) as f64);
-                    if sym_ratio < 0.5 {
+                    if sym_ratio < MIN_SIMILARITY {
                         return None;
                     }
 
@@ -613,7 +615,7 @@ impl PackEncoder {
         }
 
         let mut idx_entries = Vec::new();
-        let batch_size = usize::max(1000, entry_rx.max_capacity() / 10); // A temporary value, not optimized
+        let batch_size = usize::max(MIN_PROCESS_NUMBER, entry_rx.max_capacity() / CHANNEL_CONTENT); // A temporary value, not optimized
         tracing::info!("encode with batch size: {}", batch_size);
         loop {
             let mut batch_entries = Vec::with_capacity(batch_size);
@@ -940,7 +942,7 @@ mod tests {
             },
             None::<fn(ObjectHash)>,
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(p.number, entries.lock().await.len());
         tracing::info!("total entries: {}", p.number);
         drop(p);
@@ -966,7 +968,7 @@ mod tests {
             },
             None::<fn(ObjectHash)>,
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(p.number, entries.lock().await.len());
         tracing::info!("total entries: {}", p.number);
         drop(p);
@@ -1635,5 +1637,87 @@ mod tests {
         let duration = start.elapsed();
         tracing::info!("test executed in: {:.2?}", duration);
         tracing::info!("original total size: {}", total_original_size);
+    }
+    #[tokio::test]
+    async fn new_test_pack_encoder() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        async fn encode_once(window_size: usize) -> Vec<u8> {
+            let (tx, mut rx) = mpsc::channel(100);
+            let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1);
+
+            // make some different objects, or decode will fail
+            let str_vec = vec!["hello, word", "hello, world.", "!", "123141251251"];
+            let encoder = PackEncoder::new(str_vec.len(), window_size, tx);
+            encoder.encode_async(entry_rx).await.unwrap();
+
+            for str in str_vec {
+                let blob = Blob::from_content(str);
+                let entry: Entry = blob.into();
+                entry_tx
+                    .send(MetaAttached {
+                        inner: entry,
+                        meta: EntryMeta::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(entry_tx);
+            // assert!(encoder.get_hash().is_some());
+            let mut result = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                result.extend(chunk);
+            }
+            result
+        }
+
+        // without delta
+        let pack_without_delta = encode_once(0).await;
+        let pack_without_delta_size = pack_without_delta.len();
+        check_format(&pack_without_delta);
+        //with one
+        let pack_with_delta = encode_once(1).await;
+        assert!(pack_with_delta.len() <= pack_without_delta_size);
+        check_format(&pack_with_delta);
+        // with delta
+        let pack_with_delta = encode_once(4).await;
+        assert!(pack_with_delta.len() <= pack_without_delta_size);
+        check_format(&pack_with_delta);
+    }
+    #[tokio::test]
+    async fn out_test_pack_encoder() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        async fn encode_once(window_size: usize) -> Vec<u8> {
+            let (tx, mut rx) = mpsc::channel(100);
+            let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1);
+
+            // make some different objects, or decode will fail
+            let str_vec = vec!["hello, word", "hello, world.", "!", "123141251251"];
+            let encoder = PackEncoder::new(str_vec.len(), window_size, tx);
+            encoder.encode_async(entry_rx).await.unwrap();
+
+            for str in str_vec {
+                let blob = Blob::from_content(str);
+                let entry: Entry = blob.into();
+                entry_tx
+                    .send(MetaAttached {
+                        inner: entry,
+                        meta: EntryMeta::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(entry_tx);
+            // assert!(encoder.get_hash().is_some());
+            let mut result = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                result.extend(chunk);
+            }
+            result
+        }
+        let pack_out = encode_once(5).await;
+        check_format(&pack_out);
+
+        let pack_large = encode_once(1000).await;
+        check_format(&pack_large);
     }
 }
